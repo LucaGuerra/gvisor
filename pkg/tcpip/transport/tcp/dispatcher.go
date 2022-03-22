@@ -16,6 +16,7 @@ package tcp
 
 import (
 	"encoding/binary"
+	"fmt"
 	"math/rand"
 
 	"gvisor.dev/gvisor/pkg/sleep"
@@ -24,6 +25,7 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/hash/jenkins"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
+	"gvisor.dev/gvisor/pkg/waiter"
 )
 
 // epQueue is a queue of endpoints.
@@ -89,6 +91,114 @@ const (
 	closeWaker       = 2
 )
 
+// +checklocks:ep.mu
+func deliverAccepted(ep *endpoint) bool {
+	lEP := ep.h.listenEP
+	lEP.acceptMu.Lock()
+
+	// Remove endpoint from list of pendingEndpoints as the handshake
+	// is now complete.
+	delete(lEP.acceptQueue.pendingEndpoints, ep)
+	// Deliver this endpoint to the listening socket's accept queue.
+	if lEP.acceptQueue.capacity == 0 {
+		lEP.acceptMu.Unlock()
+		return false
+	}
+	lEP.acceptQueue.endpoints.PushBack(ep)
+	lEP.acceptMu.Unlock()
+	ep.h.listenEP.waiterQueue.Notify(waiter.ReadableEvents)
+
+	return true
+}
+
+// handleConnecting is responsible for TCP processing for an endpoint
+// in one of the connecting states.
+func (p *processor) handleConnecting(ep *endpoint) {
+	cleanup := func() {
+		ep.mu.Unlock()
+		ep.drainClosingSegmentQueue()
+		ep.waiterQueue.Notify(waiter.EventHUp | waiter.EventErr | waiter.ReadableEvents | waiter.WritableEvents)
+	}
+	// Connecting sockets are unlikely to have a contended lock with user
+	// so we just try and acquire the lock here without TryLock.
+	ep.mu.Lock()
+	if !ep.EndpointState().connecting() {
+		// If the endpoint has already transitioned out of a connecting
+		// stage then just return (only possible if it was closed or
+		// timed out by the time we got around to processing the
+		// wakeup.
+		return
+	}
+	if err := ep.h.processSegments(); err != nil {
+		// handshake failed. clean up the tcp endpoint and handshake
+		// state.
+		ep.handshakeFailed(err)
+		cleanup()
+		return
+	}
+
+	if ep.EndpointState() == StateEstablished && ep.h.listenEP != nil {
+		ep.isConnectNotified = true
+		if !deliverAccepted(ep) {
+			ep.resetConnectionLocked(&tcpip.ErrConnectionAborted{})
+			cleanup()
+			return
+		}
+	}
+	ep.mu.Unlock()
+}
+
+// handleConnected is responsible for TCP processing for an endpoint in
+// one of the connected states(StateEstablished, StateFinWait1 etc.)
+func (p *processor) handleConnected(ep *endpoint) {
+	if !ep.mu.TryLock() {
+		return
+	}
+	// NOTE: We read this outside of e.mu lock which means that by the time
+	// we get to handleSegments the endpoint may not be in ESTABLISHED. But
+	// this should be fine as all normal shutdown states are handled by
+	// handleSegments and if the endpoint moves to a CLOSED/ERROR state
+	// then handleSegments is a noop.
+	// If the endpoint is in a connected state then we do direct delivery
+	// to ensure low latency and avoid scheduler interactions.
+	switch err := ep.handleSegmentsLocked(true /* fastPath */); {
+	case err != nil:
+		// Send any active resets if required.
+		ep.resetConnectionLocked(err)
+		fallthrough
+	case ep.EndpointState() == StateClose:
+		ep.mu.Unlock()
+		ep.stack.Stats().TCP.CurrentConnected.Decrement()
+		ep.drainClosingSegmentQueue()
+		ep.waiterQueue.Notify(waiter.EventHUp | waiter.EventErr | waiter.ReadableEvents | waiter.WritableEvents)
+		return
+	case ep.EndpointState() == StateTimeWait:
+		p.startTimeWait(ep) // +checklocksforce:ep.mu
+	}
+	ep.mu.Unlock() // +checklocksforce
+}
+
+// startTimeWait starts a new goroutine to handle TIME-WAIT.
+func (p *processor) startTimeWait(ep *endpoint) {
+	go func() {
+		ep.mu.Lock()
+		// Disable close timer as we are now entering real TIME_WAIT.
+		if ep.finWait2Timer != nil {
+			ep.finWait2Timer.Stop()
+		}
+		// Wake up any waiters before we enter TIME_WAIT.
+		ep.waiterQueue.Notify(waiter.EventHUp | waiter.EventErr | waiter.ReadableEvents | waiter.WritableEvents)
+		reuseTW := ep.doTimeWait()
+		ep.transitionToStateCloseLocked()
+		ep.mu.Unlock()
+		ep.drainClosingSegmentQueue()
+		ep.waiterQueue.Notify(waiter.EventHUp | waiter.EventErr | waiter.ReadableEvents | waiter.WritableEvents)
+		if reuseTW != nil {
+			reuseTW()
+		}
+	}()
+}
+
 func (p *processor) start(wg *sync.WaitGroup) {
 	defer wg.Done()
 	defer p.sleeper.Done()
@@ -106,31 +216,29 @@ func (p *processor) start(wg *sync.WaitGroup) {
 			if ep.segmentQueue.empty() {
 				continue
 			}
-
-			// If socket has transitioned out of connected state then just let the
-			// worker handle the packet.
-			//
-			// NOTE: We read this outside of e.mu lock which means that by the time
-			// we get to handleSegments the endpoint may not be in ESTABLISHED. But
-			// this should be fine as all normal shutdown states are handled by
-			// handleSegments and if the endpoint moves to a CLOSED/ERROR state
-			// then handleSegments is a noop.
-			if ep.EndpointState() == StateEstablished && ep.mu.TryLock() {
-				// If the endpoint is in a connected state then we do direct delivery
-				// to ensure low latency and avoid scheduler interactions.
-				switch err := ep.handleSegmentsLocked(true /* fastPath */); {
-				case err != nil:
-					// Send any active resets if required.
-					ep.resetConnectionLocked(err)
-					fallthrough
-				case ep.EndpointState() == StateClose:
-					ep.notifyProtocolGoroutine(notifyTickleWorker)
-				case !ep.segmentQueue.empty():
-					p.epQ.enqueue(ep)
-				}
-				ep.mu.Unlock() // +checklocksforce
-			} else {
+			switch state := ep.EndpointState(); {
+			case state.connecting():
+				p.handleConnecting(ep)
+			case state.connected() && state != StateTimeWait:
+				p.handleConnected(ep)
+			case state == StateTimeWait:
+				// TODO(bhaskerh): get rid of TIME_WAIT goroutine.
+				fallthrough
+			case state == StateListen:
+				// TODO(bhaskerh): get rid of listen loop.
 				ep.newSegmentWaker.Assert()
+				continue
+			case state == StateError || state == StateClose:
+				// Try to redeliver any still queued packets to another endpoint
+				// or send a RST if it can't be delivered.
+				ep.drainClosingSegmentQueue()
+			default:
+				panic(fmt.Sprintf("unexpected tcp state in processor: %v", state))
+			}
+			// If there are more segments to process then requeue
+			// this endpoint for processing.
+			if !ep.segmentQueue.empty() {
+				p.epQ.enqueue(ep)
 			}
 		}
 	}
@@ -143,16 +251,15 @@ func (p *processor) start(wg *sync.WaitGroup) {
 // in-order.
 type dispatcher struct {
 	processors []processor
-	// seed is a random secret for a jenkins hash.
-	seed uint32
-	wg   sync.WaitGroup
+	wg         sync.WaitGroup
+	hasher     jenkinsHasher
 }
 
 func (d *dispatcher) init(rng *rand.Rand, nProcessors int) {
 	d.close()
 	d.wait()
 	d.processors = make([]processor, nProcessors)
-	d.seed = rng.Uint32()
+	d.hasher = jenkinsHasher{seed: rng.Uint32()}
 	for i := range d.processors {
 		p := &d.processors[i]
 		p.sleeper.AddWaker(&p.newEndpointWaker)
@@ -204,25 +311,26 @@ func (d *dispatcher) queuePacket(stackEP stack.TransportEndpoint, id stack.Trans
 		return
 	}
 
-	// For sockets not in established state let the worker goroutine
-	// handle the packets.
-	if ep.EndpointState() != StateEstablished {
-		ep.newSegmentWaker.Assert()
-		return
-	}
-
 	d.selectProcessor(id).queueEndpoint(ep)
 }
 
 func (d *dispatcher) selectProcessor(id stack.TransportEndpointID) *processor {
+
+	return &d.processors[d.hasher.hash(id)%uint32(len(d.processors))]
+}
+
+type jenkinsHasher struct {
+	seed uint32
+}
+
+func (j jenkinsHasher) hash(id stack.TransportEndpointID) uint32 {
 	var payload [4]byte
 	binary.LittleEndian.PutUint16(payload[0:], id.LocalPort)
 	binary.LittleEndian.PutUint16(payload[2:], id.RemotePort)
 
-	h := jenkins.Sum32(d.seed)
+	h := jenkins.Sum32(j.seed)
 	h.Write(payload[:])
 	h.Write([]byte(id.LocalAddress))
 	h.Write([]byte(id.RemoteAddress))
-
-	return &d.processors[h.Sum32()%uint32(len(d.processors))]
+	return h.Sum32()
 }

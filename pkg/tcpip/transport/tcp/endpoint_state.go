@@ -155,19 +155,16 @@ func (e *endpoint) afterLoad() {
 	// Restore the endpoint to InitialState as it will be moved to
 	// its origEndpointState during Resume.
 	e.state = uint32(StateInitial)
-	// Condition variables and mutexs are not S/R'ed so reinitialize
-	// acceptCond with e.acceptMu.
-	e.acceptCond = sync.NewCond(&e.acceptMu)
 	stack.StackFromEnv.RegisterRestoredEndpoint(e)
 }
 
 // Resume implements tcpip.ResumableEndpoint.Resume.
 func (e *endpoint) Resume(s *stack.Stack) {
-	e.keepalive.timer.init(s.Clock(), &e.keepalive.waker)
+	e.keepalive.timer.init(s.Clock(), timerHandler(e, e.keepaliveTimerExpired))
 	if snd := e.snd; snd != nil {
-		snd.resendTimer.init(s.Clock(), &snd.resendWaker)
-		snd.reorderTimer.init(s.Clock(), &snd.reorderWaker)
-		snd.probeTimer.init(s.Clock(), &snd.probeWaker)
+		snd.resendTimer.init(s.Clock(), timerHandler(e, e.snd.retransmitTimerExpired))
+		snd.reorderTimer.init(s.Clock(), e.snd.rc.reorderTimerExpired)
+		snd.probeTimer.init(s.Clock(), e.snd.probeTimerExpired)
 	}
 	e.stack = s
 	e.protocol = protocolFromStack(s)

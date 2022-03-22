@@ -206,9 +206,9 @@ func newSender(ep *endpoint, iss, irs seqnum.Value, sndWnd seqnum.Size, mss uint
 		s.SndWndScale = uint8(sndWndScale)
 	}
 
-	s.resendTimer.init(s.ep.stack.Clock(), &s.resendWaker)
-	s.reorderTimer.init(s.ep.stack.Clock(), &s.reorderWaker)
-	s.probeTimer.init(s.ep.stack.Clock(), &s.probeWaker)
+	s.resendTimer.init(s.ep.stack.Clock(), timerHandler(s.ep, s.retransmitTimerExpired))
+	s.reorderTimer.init(s.ep.stack.Clock(), s.rc.reorderTimerExpired)
+	s.probeTimer.init(s.ep.stack.Clock(), s.probeTimerExpired)
 
 	s.updateMaxPayloadSize(int(ep.route.MTU()), 0)
 
@@ -427,11 +427,16 @@ func (s *sender) resendSegment() {
 // unacknowledged segments are assumed lost, and thus need to be resent.
 // Returns true if the connection is still usable, or false if the connection
 // is deemed lost.
-func (s *sender) retransmitTimerExpired() bool {
+// +checklocks:s.ep.mu
+func (s *sender) retransmitTimerExpired() tcpip.Error {
+	if !s.resendTimer.enabled() {
+		return nil
+	}
+
 	// Check if the timer actually expired or if it's a spurious wake due
 	// to a previously orphaned runtime timer.
 	if !s.resendTimer.checkExpiration() {
-		return true
+		return nil
 	}
 
 	// Initialize the variables used to detect spurious recovery after
@@ -445,7 +450,7 @@ func (s *sender) retransmitTimerExpired() bool {
 	// when writeList is empty. Remove this once we have a proper fix for this
 	// issue.
 	if s.writeList.Front() == nil {
-		return true
+		return nil
 	}
 
 	s.ep.stack.Stats().TCP.Timeouts.Increment()
@@ -480,7 +485,8 @@ func (s *sender) retransmitTimerExpired() bool {
 	// window probes were acknowledged.
 	// net/ipv4/tcp_timer.c::tcp_probe_timer()
 	if remaining <= 0 || s.unackZeroWindowProbes >= s.maxRetries {
-		return false
+		s.ep.stack.Stats().TCP.EstablishedTimedout.Increment()
+		return &tcpip.ErrTimeout{}
 	}
 
 	// Set new timeout. The timer will be restarted by the call to sendData
@@ -551,19 +557,20 @@ func (s *sender) retransmitTimerExpired() bool {
 		// indefinitely.  As long as the receiving TCP continues to send
 		// acknowledgments in response to the probe segments, the sending TCP
 		// MUST allow the connection to stay open.
-		return true
+		return nil
 	}
 
 	seg := s.writeNext
 	// RFC 1122 4.2.3.5: Close the connection when the number of
 	// retransmissions for this segment is beyond a limit.
 	if seg != nil && seg.xmitCount > s.maxRetries {
-		return false
+		s.ep.stack.Stats().TCP.EstablishedTimedout.Increment()
+		return &tcpip.ErrTimeout{}
 	}
 
 	s.sendData()
 
-	return true
+	return nil
 }
 
 // pCount returns the number of packets in the segment. Due to GSO, a segment
