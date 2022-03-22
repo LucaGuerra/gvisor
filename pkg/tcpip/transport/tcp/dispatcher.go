@@ -116,12 +116,16 @@ func (p *processor) start(wg *sync.WaitGroup) {
 			// handleSegments and if the endpoint moves to a CLOSED/ERROR state
 			// then handleSegments is a noop.
 			if ep.EndpointState() == StateEstablished && ep.mu.TryLock() {
+				// TryLock ensures that ep.mu is held in this block, but checklocks does
+				// not understand this, so we need to checklocksforce several
+				// statements.
+
 				// If the endpoint is in a connected state then we do direct delivery
 				// to ensure low latency and avoid scheduler interactions.
-				switch err := ep.handleSegmentsLocked(true /* fastPath */); {
+				switch err := ep.handleSegmentsLocked(true /* fastPath */); { // +checklocksforce
 				case err != nil:
 					// Send any active resets if required.
-					ep.resetConnectionLocked(err)
+					ep.resetConnectionLocked(err) // +checklocksforce
 					fallthrough
 				case ep.EndpointState() == StateClose:
 					ep.notifyProtocolGoroutine(notifyTickleWorker)

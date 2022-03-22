@@ -195,6 +195,8 @@ func (l *listenContext) createConnectingEndpoint(s *segment, rcvdSynOpts header.
 	}
 
 	n := newEndpoint(l.stack, l.protocol, netProto, queue)
+	n.mu.Lock()
+	defer n.mu.Unlock()
 	n.ops.SetV6Only(l.v6Only)
 	n.TransportEndpointInfo.ID = s.id
 	n.boundNICID = s.nicID
@@ -711,7 +713,7 @@ func (e *endpoint) handleListenSegment(ctx *listenContext, s *segment) tcpip.Err
 			mss:                 rcvdSynOptions.MSS,
 			sampleRTTWithTSOnly: true,
 		}
-		h.transitionToStateEstablishedLocked(s)
+		h.transitionToStateEstablishedLocked(s) // +checklocksforce: ep.mu held.
 
 		// Requeue the segment if the ACK completing the handshake has more info
 		// to be procesed by the newly established endpoint.
