@@ -317,7 +317,8 @@ func getCloneSeccheckInfo(t, nt *Task) (seccheck.FieldSet, *pb.CloneInfo) {
 	t.k.tasks.mu.RLock()
 	defer t.k.tasks.mu.RUnlock()
 	info := &pb.CloneInfo{
-		CreatedThreadId:        int32(nt.k.tasks.Root.tids[t]),
+		CreatedThreadId:        int32(nt.k.tasks.Root.tids[nt]),
+		CreatedThreadGroupId:   int32(nt.k.tasks.Root.tgids[nt.tg]),
 		CreatedThreadStartTime: nt.startTime.Nanoseconds(),
 	}
 
