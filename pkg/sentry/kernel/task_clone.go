@@ -249,6 +249,7 @@ func (t *Task) Clone(args *linux.CloneArgs) (ThreadID, *SyscallControl, error) {
 
 	if seccheck.Global.Enabled(seccheck.PointClone) {
 		mask, info := getCloneSeccheckInfo(t, nt)
+		fields := seccheck.Global.GetFieldSet(seccheck.PointClone)
 		if err := seccheck.Global.Clone(t, mask, info); err != nil {
 			// nt has been visible to the rest of the system since NewTask, so
 			// it may be blocking execve or a group stop, have been notified
@@ -262,6 +263,9 @@ func (t *Task) Clone(args *linux.CloneArgs) (ThreadID, *SyscallControl, error) {
 			nt.runState = (*runExitMain)(nil)
 			return 0, nil, err
 		}
+		seccheck.Global.SendToCheckers(func(c seccheck.Checker) error {
+			return c.Clone(t, fields, info)
+		})
 	}
 
 	// "If fork/clone and execve are allowed by @prog, any child processes will

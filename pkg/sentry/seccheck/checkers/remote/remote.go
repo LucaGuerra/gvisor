@@ -150,3 +150,8 @@ func (r *Remote) TaskExit(_ context.Context, _ seccheck.FieldSet, info *pb.TaskE
 	r.write(info)
 	return nil
 }
+
+func (r *Remote) Clone(_ context.Context, _ seccheck.FieldSet, info *pb.CloneInfo) error {
+	r.write(info)
+	return nil
+}
