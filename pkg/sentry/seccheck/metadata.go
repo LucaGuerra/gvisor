@@ -41,6 +41,7 @@ const (
 	FieldCommonThreadGroupStartTime
 	FieldCommonContainerID
 	FieldCommonCredentials
+	FieldCommonProcessName
 )
 
 const (
@@ -78,6 +79,10 @@ var defaultContextFields = []FieldDesc{
 	{
 		ID:   FieldCommonCredentials,
 		Name: "credentials",
+	},
+	{
+		ID:   FieldCommonProcessName,
+		Name: "process_name",
 	},
 }
 

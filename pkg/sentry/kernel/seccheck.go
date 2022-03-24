@@ -61,5 +61,8 @@ func LoadSeccheckInfoLocked(t *Task, req seccheck.FieldMask, info *pb.Common) {
 	if req.Contains(seccheck.FieldCommonContainerID) {
 		info.ContainerId = t.tg.leader.ContainerID()
 	}
+	if req.Contains(seccheck.FieldCommonProcessName) {
+		info.ProcessName = t.Name()
+	}
 	t.Credentials().LoadSeccheckInfo(req, info)
 }

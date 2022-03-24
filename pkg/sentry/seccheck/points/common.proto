@@ -41,4 +41,6 @@ message Common {
   string container_id = 6;
 
   Credentials credentials = 7;
+
+  string process_name = 8;
 }
